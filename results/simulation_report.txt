@@ -1,0 +1,39 @@
+=================================================================
+  1-D FDTD ELECTROMAGNETIC WAVE SIMULATION — TECHNICAL REPORT
+=================================================================
+
+1. SIMULATION PARAMETERS
+   Grid cells       : 500
+   Cell size (dx)    : 1.00 mm
+   Time steps        : 1500
+   Time step (dt)    : 1.6667 ps
+   Courant number    : 0.5
+   Source position   : cell 100
+   Pulse width       : 30.0 steps
+
+2. MATERIAL CONFIGURATION
+   Slab region       : cells 250 – 350
+   Slab thickness    : 100.0 mm
+   Relative eps (er) : 4.0
+   Conductivity      : 0.0 S/m
+   Refractive index  : n = 2.000
+
+3. REFLECTION / TRANSMISSION ANALYSIS
+   Analytical Fresnel R   : -0.3333
+   Analytical Fresnel T   : 0.6667
+   Numerical peak (refl)  : 0.296108
+   Numerical peak (trans) : 0.268744
+
+4. ENERGY CONSERVATION
+   Peak energy       : 4.712655e-13 J
+   Final energy      : 1.896243e-13 J
+   Energy retention  : 40.2%
+   (Energy leaves through ABCs — expected behaviour)
+
+5. NUMERICAL METHOD
+   Algorithm         : Yee FDTD (Finite-Difference Time-Domain)
+   Boundary cond.    : First-order Mur Absorbing BC
+   Source type       : Gaussian pulse (soft / additive)
+   Stability         : Courant condition satisfied (S <= 1)
+
+=================================================================
