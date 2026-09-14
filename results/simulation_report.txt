@@ -6,7 +6,7 @@
    Grid cells       : 500
    Cell size (dx)    : 1.00 mm
    Time steps        : 1500
-   Time step (dt)    : 1.6667 ps
+   Time step (dt)    : 1.6678 ps
    Courant number    : 0.5
    Source position   : cell 100
    Pulse width       : 30.0 steps
@@ -18,22 +18,37 @@
    Conductivity      : 0.0 S/m
    Refractive index  : n = 2.000
 
-3. REFLECTION / TRANSMISSION ANALYSIS
-   Analytical Fresnel R   : -0.3333
-   Analytical Fresnel T   : 0.6667
-   Numerical peak (refl)  : 0.296108
-   Numerical peak (trans) : 0.268744
+3. REFLECTION / TRANSMISSION (two-run measurement)
+   Measurement band  : 0.05 – 7.47 GHz
+   Recording length  : 11800 steps
+   Reflected power   : 20.22 %
+   Transmitted power : 79.78 %
+   R + T             : 100.00 %   (must be 100 % for a lossless slab)
 
-4. ENERGY CONSERVATION
-   Peak energy       : 4.712655e-13 J
-   Final energy      : 1.896243e-13 J
-   Energy retention  : 40.2%
-   (Energy leaves through ABCs — expected behaviour)
+4. VALIDATION AGAINST CLOSED-FORM SLAB SOLUTION
+   Analytic R power  : 20.18 %
+   Analytic T power  : 79.82 %
+   max |R_fdtd - R_theory| : 0.07954
+   max |T_fdtd - T_theory| : 0.02176
+   rms |R_fdtd - R_theory| : 0.02066
+   rms |T_fdtd - T_theory| : 0.00662
+   Reference: Airy (Fabry-Perot) summation over the slab's
+   infinite series of internal reflections.
 
-5. NUMERICAL METHOD
+5. ENERGY BOOKKEEPING
+   Peak energy       : 4.709061e-13 J
+   Energy still in grid after 1500 steps : 4.95 %
+   ... after 11800 steps (measurement run) : 0.0001 %
+   Energy is not conserved inside the grid by design: the
+   absorbing boundaries carry it out. The measurement run is
+   long enough that what remains is negligible, which is what
+   makes the spectra above trustworthy.
+
+6. NUMERICAL METHOD
    Algorithm         : Yee FDTD (Finite-Difference Time-Domain)
    Boundary cond.    : First-order Mur Absorbing BC
    Source type       : Gaussian pulse (soft / additive)
-   Stability         : Courant condition satisfied (S <= 1)
+   Stability         : Courant S = 0.5 <= 1 (satisfied)
+   Dispersion limit  : band capped at >= 20 cells/wavelength
 
 =================================================================
