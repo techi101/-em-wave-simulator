@@ -19,19 +19,19 @@
    Refractive index  : n = 2.000
 
 3. REFLECTION / TRANSMISSION (two-run measurement)
-   Measurement band  : 0.05 – 7.47 GHz
+   Measurement band  : 0.20 – 7.47 GHz
    Recording length  : 11800 steps
-   Reflected power   : 20.22 %
-   Transmitted power : 79.78 %
+   Reflected power   : 20.85 %
+   Transmitted power : 79.15 %
    R + T             : 100.00 %   (must be 100 % for a lossless slab)
 
 4. VALIDATION AGAINST CLOSED-FORM SLAB SOLUTION
-   Analytic R power  : 20.18 %
-   Analytic T power  : 79.82 %
+   Analytic R power  : 20.80 %
+   Analytic T power  : 79.20 %
    max |R_fdtd - R_theory| : 0.07954
    max |T_fdtd - T_theory| : 0.02176
-   rms |R_fdtd - R_theory| : 0.02066
-   rms |T_fdtd - T_theory| : 0.00662
+   rms |R_fdtd - R_theory| : 0.02087
+   rms |T_fdtd - T_theory| : 0.00669
    Reference: Airy (Fabry-Perot) summation over the slab's
    infinite series of internal reflections.
 

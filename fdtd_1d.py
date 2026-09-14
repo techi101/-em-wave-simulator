@@ -82,10 +82,51 @@ class SimConfig:
             self.probe_refl = (self.source_pos + self.slab_start) // 2
         if self.probe_trans is None:
             self.probe_trans = (self.slab_end + self.num_cells - 1) // 2
-        for name in ("probe_refl", "probe_trans"):
-            idx = getattr(self, name)
+        self.validate()
+
+    def validate(self) -> None:
+        """
+        Check the layout before anything runs.
+
+        Numpy slicing silently clips out-of-range indices, so a slab placed
+        outside the grid used to produce a simulation with no slab in it and
+        a plausible-looking report. Every position is checked explicitly, and
+        the ordering source < probe < slab < probe is enforced because the
+        two-run measurement depends on it: the reflection probe has to sit
+        where only the reflected wave reaches it, and the transmission probe
+        behind the slab.
+        """
+        if self.courant > 1.0:
+            raise ValueError(
+                f"courant={self.courant} violates the stability condition "
+                f"(S <= 1); the simulation would diverge."
+            )
+        if not 0 < self.slab_start < self.slab_end <= self.num_cells:
+            raise ValueError(
+                f"slab spans cells {self.slab_start}..{self.slab_end}, which does "
+                f"not fit a {self.num_cells}-cell grid. Pass --cells larger than "
+                f"{self.slab_end}, or move the slab."
+            )
+        order = [
+            ("source_pos", self.source_pos),
+            ("probe_refl", self.probe_refl),
+            ("slab_start", self.slab_start),
+            ("slab_end", self.slab_end),
+            ("probe_trans", self.probe_trans),
+        ]
+        for name, idx in order:
             if not 0 <= idx < self.num_cells:
-                raise ValueError(f"{name}={idx} is outside the grid (0..{self.num_cells-1})")
+                raise ValueError(
+                    f"{name}={idx} is outside a {self.num_cells}-cell grid "
+                    f"(valid 0..{self.num_cells - 1})"
+                )
+        for (lo_name, lo), (hi_name, hi) in zip(order, order[1:]):
+            if lo >= hi:
+                raise ValueError(
+                    f"{lo_name}={lo} must be strictly left of {hi_name}={hi}. "
+                    f"Required layout: source < probe_refl < slab_start < "
+                    f"slab_end < probe_trans."
+                )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -497,15 +538,19 @@ def main():
     parser.add_argument("--output", type=str, default="results",
                         help="Output directory for plots and report")
     args = parser.parse_args()
-    
-    # Configure
-    cfg = SimConfig(
-        num_cells=args.cells,
-        num_steps=args.steps,
-        eps_r=args.eps_r,
-        sigma=args.sigma,
-    )
-    
+
+    # Configure. A bad layout (e.g. --cells smaller than the slab position)
+    # is a usage error, so report it as one rather than as a traceback.
+    try:
+        cfg = SimConfig(
+            num_cells=args.cells,
+            num_steps=args.steps,
+            eps_r=args.eps_r,
+            sigma=args.sigma,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
     print()
     print("=" * 60)
     print("  1-D FDTD ELECTROMAGNETIC WAVE SIMULATOR")

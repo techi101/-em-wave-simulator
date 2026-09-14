@@ -29,11 +29,19 @@ from fdtd_1d import C0, EPS0, ETA0, MU0, FDTDEngine, SimConfig
 from scattering import analytic_slab_rt, default_num_steps, measure_scattering
 
 
+# One recording length for every default-geometry measurement in this file,
+# sized for the slowest case here (eps_r = 9). scattering.py caches the
+# empty-grid reference run per (geometry, num_steps), so holding num_steps
+# fixed means that run happens once for the whole suite instead of once per
+# eps_r. Same physics, roughly half the wall clock.
+SHARED_STEPS = default_num_steps(SimConfig(eps_r=9.0))
+
+
 # ── Shared, cached measurements (each is two full grid runs) ─────────────────
 
 @pytest.fixture(scope="module")
 def slab_measurement():
-    return measure_scattering(SimConfig(eps_r=4.0))
+    return measure_scattering(SimConfig(eps_r=4.0), num_steps=SHARED_STEPS)
 
 
 @pytest.fixture(scope="module")
@@ -84,7 +92,27 @@ class TestSimConfig:
 
     def test_probe_outside_grid_is_rejected(self):
         with pytest.raises(ValueError):
-            SimConfig(num_cells=200, probe_refl=500)
+            SimConfig(num_cells=600, probe_refl=900)
+
+    def test_slab_outside_grid_is_rejected(self):
+        """
+        Numpy slicing clips silently, so a slab placed past the end of the
+        grid used to yield a simulation containing no slab at all — and a
+        report that looked entirely plausible.
+        """
+        with pytest.raises(ValueError, match="does not fit"):
+            SimConfig(num_cells=200)
+
+    def test_unstable_courant_is_rejected(self):
+        with pytest.raises(ValueError, match="stability"):
+            SimConfig(courant=1.5)
+
+    def test_probe_ordering_is_enforced(self):
+        """The measurement is only meaningful for source < probe < slab < probe."""
+        with pytest.raises(ValueError, match="strictly left"):
+            SimConfig(probe_refl=300)          # would sit inside the slab
+        with pytest.raises(ValueError, match="strictly left"):
+            SimConfig(probe_trans=300)         # would sit inside the slab
 
 
 # ── Engine initialisation ────────────────────────────────────────────────────
@@ -168,7 +196,7 @@ class TestAbsorbingBoundaries:
 
     def test_free_space_scatters_nothing(self):
         """With eps_r = 1 there is no slab, so R ~ 0 and T ~ 1."""
-        result = measure_scattering(SimConfig(eps_r=1.0))
+        result = measure_scattering(SimConfig(eps_r=1.0), num_steps=SHARED_STEPS)
         assert result["R_power"] < 1e-3
         assert result["T_power"] == pytest.approx(1.0, abs=1e-3)
 
@@ -179,14 +207,37 @@ class TestEnergyConservation:
     @pytest.mark.parametrize("eps_r", [2.0, 4.0, 9.0])
     def test_lossless_slab_conserves_power(self, eps_r):
         """R + T = 1 exactly for a lossless slab. Nothing else is acceptable."""
-        result = measure_scattering(SimConfig(eps_r=eps_r))
+        result = measure_scattering(SimConfig(eps_r=eps_r), num_steps=SHARED_STEPS)
         assert result["power_sum"] == pytest.approx(1.0, abs=2e-3)
 
     def test_lossy_slab_absorbs(self):
-        lossless = measure_scattering(SimConfig(eps_r=4.0, sigma=0.0))
-        lossy = measure_scattering(SimConfig(eps_r=4.0, sigma=0.05))
+        lossless = measure_scattering(SimConfig(eps_r=4.0, sigma=0.0), num_steps=SHARED_STEPS)
+        lossy = measure_scattering(SimConfig(eps_r=4.0, sigma=0.05), num_steps=SHARED_STEPS)
         assert lossy["power_sum"] < lossless["power_sum"] - 0.01
         assert lossy["T_power"] < lossless["T_power"]
+
+    @pytest.mark.parametrize("sigma", [0.01, 0.05, 0.2])
+    def test_lossy_slab_matches_analytic(self, sigma):
+        """
+        Pins the sign convention of the complex permittivity.
+
+        With eps_c = eps_r + i*sigma/(omega*eps0) and Im(n) >= 0 the wave
+        decays inside the slab; get the branch wrong and the closed form
+        predicts gain instead. Only an FDTD comparison catches that, since
+        "R + T < 1" alone is satisfied by either sign of the error.
+        """
+        result = measure_scattering(SimConfig(eps_r=4.0, sigma=sigma), num_steps=SHARED_STEPS)
+        assert result["R_power"] == pytest.approx(
+            result["R_power_analytic"], abs=5e-3)
+        assert result["T_power"] == pytest.approx(
+            result["T_power_analytic"], abs=5e-3)
+        assert 0.0 < 1.0 - result["power_sum"] < 1.0      # genuine absorption
+
+    def test_absorption_increases_with_conductivity(self):
+        absorbed = [1.0 - measure_scattering(
+            SimConfig(eps_r=4.0, sigma=s), num_steps=SHARED_STEPS)["power_sum"]
+            for s in (0.0, 0.01, 0.05)]
+        assert absorbed[0] < absorbed[1] < absorbed[2]
 
 
 # ── Validation against the closed-form slab solution ─────────────────────────
@@ -271,10 +322,11 @@ class TestMeasurementRobustness:
         assert short["T_power"] == pytest.approx(long["T_power"], abs=2e-3)
 
     def test_reflection_increases_with_contrast(self):
-        r = [measure_scattering(SimConfig(eps_r=e))["R_power"]
+        r = [measure_scattering(SimConfig(eps_r=e), num_steps=SHARED_STEPS)["R_power"]
              for e in (1.5, 3.0, 6.0, 9.0)]
         assert all(a < b for a, b in zip(r, r[1:]))
 
+    @pytest.mark.slow
     def test_second_order_convergence(self):
         """
         Halving dx should cut the error roughly fourfold for the second-order
@@ -296,6 +348,31 @@ class TestMeasurementRobustness:
         cfg = SimConfig(eps_r=4.0)
         result = measure_scattering(cfg, num_steps=default_num_steps(cfg))
         assert result["residual_energy_fraction"] < 1e-3
+
+    def test_coarse_frequency_resolution_is_rejected(self):
+        """
+        A too-short recording gives FFT bins so wide that the first one inside
+        the band sits far above the band's lower edge, which shifts the band
+        average for reasons that have nothing to do with the slab. Better to
+        refuse than to return a number that quietly depends on run length.
+        """
+        with pytest.raises(RuntimeError, match="too coarse"):
+            measure_scattering(SimConfig(eps_r=4.0), num_steps=2000)
+
+    def test_band_lower_edge_is_pinned_to_a_frequency(self):
+        """
+        Regression. The band used to start at the first non-zero FFT bin,
+        which is 1/(N*dt) and therefore moved with run length, so the reported
+        R crept from 0.2059 at 4k steps to 0.2013 at 24k. The disagreement
+        with theory was constant at +4e-4 throughout — the metric was moving,
+        not the physics.
+        """
+        for steps in (8000, 16000):
+            result = measure_scattering(SimConfig(eps_r=4.0), num_steps=steps)
+            assert result["band_hz"][0] >= 0.2e9
+            # Measured and analytic must track each other regardless of length.
+            assert result["R_power"] - result["R_power_analytic"] == \
+                pytest.approx(4.3e-4, abs=2e-4)
 
     def test_band_excludes_under_resolved_frequencies(self, slab_measurement):
         """The band must stop before numerical dispersion dominates."""

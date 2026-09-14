@@ -54,6 +54,19 @@ MIN_CELLS_PER_WAVELENGTH = 20.0
 # meaningless when the denominator is ~0.
 MIN_SPECTRAL_FRACTION = 0.01
 
+# Fixed lower edge of the measurement band.
+#
+# This has to be pinned to a frequency rather than left at "the first non-zero
+# FFT bin", because that bin is 1/(N*dt) and therefore moves as the recording
+# gets longer. The band-integrated R would then creep as num_steps grew (0.2059
+# at 4k steps down to 0.2013 at 24k) purely because ever more near-DC bins —
+# where the slab is electrically thin, R -> 0, and the Gaussian carries its
+# most spectral weight — were being averaged in. That is a moving definition,
+# not a converging measurement: the discrepancy against theory was pinned at
+# +0.0004 the whole time. Pinning the edge makes the reported number
+# reproducible and independent of run length.
+BAND_LO_HZ = 0.2e9
+
 
 # =============================================================================
 # Closed-form solution for a dielectric slab in free space (normal incidence)
@@ -208,20 +221,47 @@ def measure_scattering(cfg: SimConfig,
     amp = np.abs(Ei_r)
     band = ((amp >= MIN_SPECTRAL_FRACTION * amp.max())
             & (freqs <= f_dispersion)
-            & (freqs > 0))
+            & (freqs >= BAND_LO_HZ))
 
     if not np.any(band):
         raise RuntimeError(
-            "No usable frequency band - check pulse width against grid size."
+            f"No usable frequency band between {BAND_LO_HZ/1e9:.2f} GHz and the "
+            f"dispersion limit {f_dispersion/1e9:.2f} GHz - check the pulse "
+            f"width against the grid size."
+        )
+
+    # The FFT bin spacing is 1/(N*dt). If it is coarse next to the band's lower
+    # edge, the first bin inside the band lands well above that edge and the
+    # band average shifts — not because the physics changed but because the
+    # recording was too short to resolve it. default_num_steps() always clears
+    # this; a hand-picked, very short num_steps may not.
+    df = freqs[1] - freqs[0]
+    if df > BAND_LO_HZ / 2.0:
+        raise RuntimeError(
+            f"num_steps={num_steps} gives {df/1e6:.0f} MHz frequency resolution, "
+            f"too coarse for a band starting at {BAND_LO_HZ/1e9:.2f} GHz. "
+            f"Use at least {int(2.0 / (BAND_LO_HZ * dt))} steps "
+            f"(default_num_steps() sizes this for you)."
         )
 
     f_band = freqs[band]
     R_f = np.abs(Er[band]) / np.abs(Ei_r[band])
     T_f = np.abs(Et[band]) / np.abs(Ei_t[band])
 
-    # -- Band-integrated power fractions (Parseval over the usable band) -----
-    inc_power = np.sum(np.abs(Ei_r[band]) ** 2)
-    R_power = float(np.sum(np.abs(Er[band]) ** 2) / inc_power)
+    # -- Band-integrated power fractions -------------------------------------
+    #
+    # Computed on the FFT's own bins, weighted by incident spectral power, and
+    # over a band whose lower edge is pinned to a frequency (see BAND_LO_HZ).
+    #
+    # Deliberately NOT resampled onto a denser fixed grid. Below the lowest
+    # bin the band actually contains, interpolation would be inventing data
+    # that was never measured — holding the edge value flat across a stretch
+    # of spectrum that carries heavy weight. Trying it moved the result by
+    # 3e-3 on short recordings and made the analytic comparison disagree with
+    # itself. The bins are the measurement; the resolution guard above is what
+    # keeps them fine enough to trust.
+    weight = np.abs(Ei_r[band]) ** 2
+    R_power = float(np.sum(np.abs(Er[band]) ** 2) / np.sum(weight))
     T_power = float(np.sum(np.abs(Et[band]) ** 2) / np.sum(np.abs(Ei_t[band]) ** 2))
 
     # How much energy was still bouncing around when we stopped recording?
@@ -246,7 +286,6 @@ def measure_scattering(cfg: SimConfig,
         thickness = (cfg.slab_end - cfg.slab_start) * cfg.dx
         r_a, t_a = analytic_slab_rt(f_band, cfg.eps_r, thickness, cfg.sigma)
         R_a, T_a = np.abs(r_a), np.abs(t_a)
-        w = np.abs(Ei_r[band]) ** 2            # weight by incident spectral power
         out.update({
             "R_analytic_f": R_a,
             "T_analytic_f": T_a,
@@ -254,8 +293,10 @@ def measure_scattering(cfg: SimConfig,
             "max_T_error": float(np.max(np.abs(T_f - T_a))),
             "rms_R_error": float(np.sqrt(np.mean((R_f - R_a) ** 2))),
             "rms_T_error": float(np.sqrt(np.mean((T_f - T_a) ** 2))),
-            "R_power_analytic": float(np.sum(R_a ** 2 * w) / np.sum(w)),
-            "T_power_analytic": float(np.sum(T_a ** 2 * w) / np.sum(w)),
+            # Same bins and same weights as the measured band powers, so the
+            # two numbers are comparable like for like.
+            "R_power_analytic": float(np.sum(R_a ** 2 * weight) / np.sum(weight)),
+            "T_power_analytic": float(np.sum(T_a ** 2 * weight) / np.sum(weight)),
         })
 
     return out

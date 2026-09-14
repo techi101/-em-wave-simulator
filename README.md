@@ -1,22 +1,22 @@
 # 1-D FDTD Electromagnetic Wave Simulator
 
-> A Python Finite-Difference Time-Domain solver for electromagnetic propagation through dielectric media, on a Yee grid — and, more to the point, a **validated** one: broadband reflection and transmission are measured from the grid and checked against the closed-form slab solution, they conserve power to 1 part in 10⁴, and the scheme converges at second order under grid refinement.
+> A Python Finite-Difference Time-Domain solver for electromagnetic propagation through dielectric media, on a Yee grid — and, more to the point, a **validated** one: broadband reflection and transmission are measured from the grid and checked against the closed-form slab solution, they conserve power to 1 part in 2×10⁵, and the scheme converges at second order under grid refinement.
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square)](https://python.org)
 [![NumPy](https://img.shields.io/badge/NumPy-Scientific_Computing-green?style=flat-square)](https://numpy.org)
-[![Tests](https://img.shields.io/badge/Tests-35%20Passed-brightgreen?style=flat-square)](#running-tests)
+[![Tests](https://img.shields.io/badge/Tests-44%20Passed-brightgreen?style=flat-square)](#running-tests)
 
 ---
 
 ## Headline Results
 
-Default case — a 100 mm slab of ε_r = 4 (FR-4), broadband Gaussian pulse, measured over 0.05–7.47 GHz:
+Default case — a 100 mm slab of ε_r = 4 (FR-4), broadband Gaussian pulse, measured over 0.20–7.47 GHz:
 
 | Quantity | FDTD | Closed form | Error |
 |:---|---:|---:|---:|
-| Reflected power (band-averaged) | 20.22 % | 20.18 % | 0.04 pp |
-| Transmitted power (band-averaged) | 79.78 % | 79.82 % | 0.04 pp |
-| **R + T** | **100.000 %** | 100 % | **4×10⁻⁵** |
+| Reflected power (band-averaged) | 20.85 % | 20.80 % | 0.04 pp |
+| Transmitted power (band-averaged) | 79.15 % | 79.20 % | 0.04 pp |
+| **R + T** | **100.0005 %** | 100 % | **4.8×10⁻⁶** |
 | max &#124;R(f) − R_theory(f)&#124; over the band | — | — | 0.080 |
 | rms &#124;R(f) − R_theory(f)&#124; over the band | — | — | 0.021 |
 
@@ -35,9 +35,13 @@ quarter the error):
 
 | dx | cells | rms R error | ratio |
 |---:|---:|---:|---:|
-| 1.00 mm | 500 | 0.02066 | — |
-| 0.50 mm | 1000 | 0.01283 | 1.61× |
-| 0.25 mm | 2000 | 0.00320 | **4.01×** |
+| 1.00 mm | 500 | 0.02087 | — |
+| 0.50 mm | 1000 | 0.01293 | 1.61× |
+| 0.25 mm | 2000 | 0.00322 | **4.01×** |
+
+(The first ratio falls short of 4× because at `dx` = 1 mm the top of the band
+sits right at the 20-cells-per-wavelength limit, so that grid is not yet in the
+asymptotic regime. The second is.)
 
 ---
 
@@ -69,11 +73,16 @@ R(f) = |E_refl(f)|  / |E_inc(f)|
 T(f) = |E_trans(f)| / |E_inc(f)|
 ```
 
-Two guards keep the result honest. Frequencies where the incident pulse
-carries under 1 % of its peak spectral amplitude are discarded (dividing by
-≈0 is meaningless), and so are frequencies resolved by fewer than 20 cells per
-wavelength inside the slab, where numerical dispersion rather than physics
-sets the answer.
+Three guards keep the result honest:
+
+- Frequencies where the incident pulse carries under 1 % of its peak spectral
+  amplitude are discarded — dividing by ≈0 is meaningless.
+- So are frequencies resolved by fewer than 20 cells per wavelength inside the
+  slab, where numerical dispersion rather than physics sets the answer.
+- The band's **lower** edge is pinned to a fixed frequency (0.2 GHz) rather
+  than the first non-zero FFT bin, which is `1/(N·dt)` and therefore moves
+  with run length. A recording too short to resolve that edge is refused
+  outright instead of quietly returning a run-length-dependent number.
 
 The whole measurement lives in [`scattering.py`](scattering.py).
 
@@ -133,12 +142,12 @@ closed-form solution, and R + T = 1.
 
 ```
  eps_r    R meas  R theory    T meas  T theory       R+T
-   1.5    0.0205    0.0205    0.9795    0.9795   1.00000
-   4.5    0.2311    0.2306    0.7689    0.7694   1.00000
-   9.5    0.4165    0.4158    0.5835    0.5842   1.00000
+   1.5    0.0214    0.0214    0.9786    0.9786   1.00000
+   4.5    0.2368    0.2363    0.7632    0.7637   1.00000
+   9.5    0.4184    0.4177    0.5816    0.5823   1.00000
 
- Worst |R_measured - R_theory| : 0.00070
- Worst |(R + T) - 1|           : 4.23e-05
+ Worst |R_measured - R_theory| : 0.00076
+ Worst |(R + T) - 1|           : 4.54e-05
 ```
 
 ---
@@ -166,13 +175,17 @@ round-trip phase `φ = 2·k₀·n·d`, supplied as `cos φ` and `sin φ`. Reflec
 is periodic in φ, so this is the right basis; without it a low-order
 polynomial cannot represent the resonance at all, and the scores say so.
 
-Searching 100,000 candidate designs through the surrogate takes ~70 ms and
-returns ε_r ≈ 5.28 at 65 mm. A confirming FDTD run measures **0.00046**
-reflected power — and 65 mm is a third-order half-wave window for that index
-(`3·λ₀/2n = 65.3 mm`), so the surrogate rediscovered the physics rather than
-memorising the samples.
+Searching 100,000 candidate designs through the surrogate takes well under a
+second and returns ε_r ≈ 5.28 at 65 mm. A confirming FDTD run measures
+**0.00046** reflected power — and 65 mm is a third-order half-wave window for
+that index (`3·λ₀/2n = 65.3 mm`), so the surrogate rediscovered the physics
+rather than memorising the samples.
 
-Cost per design point: **423 ms** of FDTD versus **0.69 µs** of surrogate.
+Cost per design point is roughly **10⁶×** lower for the surrogate — seconds of
+FDTD against microseconds of inference. Both halves of that ratio are timed
+inside the same run, so the ratio holds up even though the absolute
+milliseconds move by several-fold with machine load; the script prints what it
+actually measured rather than a figure baked into this file.
 
 ---
 
@@ -185,7 +198,7 @@ em-wave-simulator/
 ├── parameter_sweep.py   ← Sweep eps_r; measured vs theory, with error panel
 ├── surrogate_model.py   ← ML surrogate on measured output + design search
 ├── tests/
-│   └── test_fdtd.py     ← 35 pytest tests
+│   └── test_fdtd.py     ← 44 pytest tests
 ├── results/             ← Auto-generated plots and report
 │   ├── validation_spectra.png   ← FDTD vs closed form
 │   ├── parameter_sweep.png
@@ -233,7 +246,9 @@ fixes are most of what the code now demonstrates.
 | `c` was hard-coded to `3.0e8` while the update coefficients used exact `mu0`, `eps0` — a 0.07 % inconsistency that detunes the ABC | `C0 = 1/sqrt(mu0*eps0)`, asserted exactly in the tests |
 | The surrogate model trained on `abs(R_analytical)` — a closed-form formula — while the plot labelled it "FDTD Simulation (ground truth)". Its R² measured nothing | Trains on measured FDTD output; naive vs physics-informed features compared honestly on held-out data |
 | Magnetic energy was summed at n+1/2 against electric energy at n, adding a half-step sawtooth to the "energy conservation" plot | Hy time-centred by averaging across the half step |
-| Tests asserted leftover numerical residue (e.g. "peak &#124;Ez&#124; > 0.01 after 1500 steps") and passed regardless of solver correctness | 35 tests covering energy conservation, spectral agreement with theory, ABC quality, run-length independence, and second-order convergence |
+| The band-averaged R and T were summed over the FFT's own bins starting at the first non-zero one — which is `1/(N·dt)`, so the reported figure crept from 0.2059 to 0.2013 as the run lengthened, purely because more near-DC bins were being averaged in. The disagreement with theory was a constant +4×10⁻⁴ throughout: the metric was moving, not the physics | Band lower edge pinned to a fixed frequency; too-coarse recordings refused rather than silently returning a run-length-dependent number |
+| A slab placed outside the grid was silently clipped by numpy slicing, producing a simulation with no slab in it and a plausible-looking report | `SimConfig.validate()` checks the whole layout up front; CLI misuse reports a usage error, not a traceback |
+| Tests asserted leftover numerical residue (e.g. "peak &#124;Ez&#124; > 0.01 after 1500 steps") and passed regardless of solver correctness | 44 tests covering energy conservation, spectral agreement with theory, ABC quality, run-length independence, lossy-medium agreement, layout validation, and second-order convergence |
 
 ---
 
@@ -244,10 +259,14 @@ pytest tests/ -v
 ```
 
 ```
-tests/test_fdtd.py ...................................          [100%]
+tests/test_fdtd.py ............................................   [100%]
 
-35 passed in 8.89s
+44 passed in 84s
 ```
+
+Most of that time is physics: each scattering test is two full grid runs, and
+the grid-refinement study runs 1000- and 2000-cell grids. Skip it with
+`pytest -m "not slow"`.
 
 Notable cases:
 
@@ -258,6 +277,11 @@ Notable cases:
 - `test_empty_grid_echo_is_small` — boundary reflection < −40 dB
 - `test_half_wave_window_is_transparent` — the slab vanishes at resonance
 - `test_lossy_slab_absorbs` — σ > 0 gives R + T < 1
+- `test_lossy_slab_matches_analytic` — pins the complex-permittivity branch; a
+  flipped sign would predict gain, and "R + T < 1" alone would not catch it
+- `test_band_lower_edge_is_pinned_to_a_frequency` — the reported figure cannot
+  drift with run length
+- `test_slab_outside_grid_is_rejected` — no silently-empty simulations
 
 ---
 
@@ -269,5 +293,5 @@ Notable cases:
 | Scientific computing | NumPy |
 | Visualisation | Matplotlib |
 | ML surrogate | scikit-learn |
-| Testing | pytest (35 tests) |
+| Testing | pytest (44 tests) |
 | CLI | argparse (stdlib) |
