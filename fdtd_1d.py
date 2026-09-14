@@ -31,9 +31,13 @@ import os
 # ═══════════════════════════════════════════════════════════════════════════════
 # Physical constants
 # ═══════════════════════════════════════════════════════════════════════════════
-C0   = 3.0e8          # speed of light in vacuum  (m/s)
 MU0  = 4.0e-7 * np.pi # permeability of free space (H/m)
 EPS0 = 8.854187817e-12 # permittivity of free space (F/m)
+# c is DERIVED from mu0 and eps0 rather than hard-coded to 3e8. The Mur ABC
+# coefficient and the Courant number both compare c*dt against dx, so a c that
+# disagrees with the mu0/eps0 used in the update coefficients by 0.07% detunes
+# the boundary and leaves a spurious reflection behind.
+C0   = 1.0 / np.sqrt(MU0 * EPS0)   # speed of light in vacuum (m/s)
 ETA0 = np.sqrt(MU0 / EPS0)  # impedance of free space (~377 ohms)
 
 
@@ -61,12 +65,68 @@ class SimConfig:
     slab_end:     int   = 350       # cell where slab ends
     eps_r:        float = 4.0       # relative permittivity (e.g., FR-4 PCB substrate ≈ 4.0)
     sigma:        float = 0.0       # conductivity (S/m), 0 = lossless
-    
+
+    # Field probes — cells whose Ez time history is recorded every step.
+    # These drive the reflection/transmission measurement in scattering.py.
+    # Defaults (None) place them midway between source and slab, and midway
+    # between the slab and the right boundary.
+    probe_refl:   Optional[int] = None   # probe between source and slab
+    probe_trans:  Optional[int] = None   # probe behind the slab
+
     # Derived quantities (computed post-init)
     dt:           float = field(init=False)
-    
+
     def __post_init__(self):
         self.dt = self.courant * self.dx / C0
+        if self.probe_refl is None:
+            self.probe_refl = (self.source_pos + self.slab_start) // 2
+        if self.probe_trans is None:
+            self.probe_trans = (self.slab_end + self.num_cells - 1) // 2
+        self.validate()
+
+    def validate(self) -> None:
+        """
+        Check the layout before anything runs.
+
+        Numpy slicing silently clips out-of-range indices, so a slab placed
+        outside the grid used to produce a simulation with no slab in it and
+        a plausible-looking report. Every position is checked explicitly, and
+        the ordering source < probe < slab < probe is enforced because the
+        two-run measurement depends on it: the reflection probe has to sit
+        where only the reflected wave reaches it, and the transmission probe
+        behind the slab.
+        """
+        if self.courant > 1.0:
+            raise ValueError(
+                f"courant={self.courant} violates the stability condition "
+                f"(S <= 1); the simulation would diverge."
+            )
+        if not 0 < self.slab_start < self.slab_end <= self.num_cells:
+            raise ValueError(
+                f"slab spans cells {self.slab_start}..{self.slab_end}, which does "
+                f"not fit a {self.num_cells}-cell grid. Pass --cells larger than "
+                f"{self.slab_end}, or move the slab."
+            )
+        order = [
+            ("source_pos", self.source_pos),
+            ("probe_refl", self.probe_refl),
+            ("slab_start", self.slab_start),
+            ("slab_end", self.slab_end),
+            ("probe_trans", self.probe_trans),
+        ]
+        for name, idx in order:
+            if not 0 <= idx < self.num_cells:
+                raise ValueError(
+                    f"{name}={idx} is outside a {self.num_cells}-cell grid "
+                    f"(valid 0..{self.num_cells - 1})"
+                )
+        for (lo_name, lo), (hi_name, hi) in zip(order, order[1:]):
+            if lo >= hi:
+                raise ValueError(
+                    f"{lo_name}={lo} must be strictly left of {hi_name}={hi}. "
+                    f"Required layout: source < probe_refl < slab_start < "
+                    f"slab_end < probe_trans."
+                )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -118,19 +178,41 @@ class FDTDEngine:
         # ── Diagnostics ──────────────────────────────────────────────────────
         self.energy_history = []
         self.snapshots = []           # (step, Ez_copy) tuples
-    
+
+        # Hy half a step behind the current one, kept so that magnetic energy
+        # can be evaluated at the same instant as electric energy. Ez lives at
+        # integer steps and Hy at half-integer steps, so summing them directly
+        # produces a sawtooth that looks like an energy-conservation failure.
+        self.Hy_prev = np.zeros(N)
+
+        # ── Field probes (Ez time history at fixed cells) ────────────────────
+        self.probe_cells = (cfg.probe_refl, cfg.probe_trans)
+        self.probe_data = {c: np.zeros(cfg.num_steps) for c in self.probe_cells}
+
+
     def gaussian_source(self, step: int) -> float:
         """Gaussian pulse: E(t) = exp(-0.5 * ((t - delay) / width)^2)"""
         return np.exp(-0.5 * ((step - self.cfg.pulse_delay) / self.cfg.pulse_width) ** 2)
     
     def update_H(self):
         """Advance magnetic field by half a time step."""
+        self.Hy_prev[:] = self.Hy
         self.Hy[:-1] += self.Db * (self.Ez[1:] - self.Ez[:-1])
     
     def update_E(self):
-        """Advance electric field by one time step."""
-        self.Ez[1:] = self.Ca[1:] * self.Ez[1:] + \
-                      self.Cb[1:] * (self.Hy[1:] - self.Hy[:-1])
+        """
+        Advance electric field by one time step — INTERIOR CELLS ONLY.
+
+        Ez[0] and Ez[-1] are boundary nodes owned by the Mur ABC, which needs
+        them still holding their time-n values when it runs. Updating the last
+        cell here (Ez[1:] rather than Ez[1:-1]) leaves the right-hand ABC
+        differencing a time-(n+1) value against a time-n one, which detunes it
+        into a near-perfect mirror: an empty grid then returned ~90% of the
+        pulse amplitude off the right wall. The left boundary was accidentally
+        correct because Ez[0] was already excluded.
+        """
+        self.Ez[1:-1] = self.Ca[1:-1] * self.Ez[1:-1] + \
+                        self.Cb[1:-1] * (self.Hy[1:-1] - self.Hy[:-2])
     
     def apply_source(self, step: int):
         """Inject Gaussian pulse as a soft source (additive)."""
@@ -153,19 +235,32 @@ class FDTDEngine:
         self.Ez_right_prev = self.Ez[-2]
     
     def compute_energy(self) -> float:
-        """Total EM energy in the grid (electric + magnetic)."""
+        """
+        Total EM energy in the grid (electric + magnetic).
+
+        The magnetic term uses the average of Hy at n-1/2 and n+1/2 so that
+        both terms are evaluated at time step n. Without this the leap-frog
+        staggering shows up as a half-step ripple on the energy curve.
+        """
         E_energy = 0.5 * np.sum(self.eps_profile * self.Ez ** 2) * self.cfg.dx
-        H_energy = 0.5 * MU0 * np.sum(self.Hy ** 2) * self.cfg.dx
+        Hy_centered = 0.5 * (self.Hy + self.Hy_prev)
+        H_energy = 0.5 * MU0 * np.sum(Hy_centered ** 2) * self.cfg.dx
         return E_energy + H_energy
-    
+
+    def record_probes(self, n: int):
+        """Store Ez at each probe cell for this time step."""
+        for cell in self.probe_cells:
+            self.probe_data[cell][n] = self.Ez[cell]
+
     def step(self, n: int):
         """Execute one complete FDTD time step."""
         self.update_H()
         self.update_E()
         self.apply_source(n)
         self.apply_mur_abc()
+        self.record_probes(n)
         self.energy_history.append(self.compute_energy())
-    
+
     def run(self, snapshot_interval: int = 50):
         """Run the full simulation."""
         for n in range(self.cfg.num_steps):
@@ -285,40 +380,62 @@ def plot_material_profile(cfg: SimConfig, output_dir: str = "results"):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Reflection & Transmission Analysis
 # ═══════════════════════════════════════════════════════════════════════════════
-def compute_reflection_transmission(engine: FDTDEngine) -> dict:
+# NOTE: an earlier version of this file measured R and T as
+#   peak |Ez| left of the slab  /  peak |Ez| right of the slab
+# taken from the FINAL field snapshot. That number is not a reflection
+# coefficient. After the absorbing boundaries have drained the grid it decays
+# towards zero, so the "measurement" was really a function of --steps, and it
+# was reported next to a single-interface Fresnel coefficient it could not be
+# compared against (field vs. peak amplitude, one interface vs. two).
+#
+# The measurement now lives in scattering.measure_scattering(), which runs the
+# grid twice (empty reference + slab), subtracts to isolate the scattered
+# field, and reports R(f)/T(f) across the pulse bandwidth.
+
+
+def plot_validation(result: dict, cfg: SimConfig, output_dir: str = "results"):
     """
-    Estimate reflection and transmission coefficients.
-    
-    Theory (for a lossless slab at normal incidence):
-      R = (n1 - n2) / (n1 + n2)   at each interface
-      where n = sqrt(eps_r) is the refractive index.
-    
-    We compare the analytical Fresnel coefficient with the
-    numerically observed reflected/transmitted pulse amplitudes.
+    Plot measured R(f) and T(f) against the closed-form slab solution.
+
+    This is the plot that actually demonstrates the solver is correct: the
+    Fabry-Perot ripple (the slab resonating at multiples of a half-wavelength)
+    has to line up with theory, not just the average level.
     """
-    cfg = engine.cfg
-    n1, n2 = 1.0, np.sqrt(cfg.eps_r)
-    
-    # Analytical single-interface Fresnel reflection
-    R_analytical = (n1 - n2) / (n1 + n2)
-    T_analytical = 2 * n1 / (n1 + n2)
-    
-    # Numerical: measure peak Ez in reflected and transmitted regions
-    # (after the simulation has run long enough for the pulse to fully interact)
-    reflected_region = engine.Ez[:cfg.slab_start]
-    transmitted_region = engine.Ez[cfg.slab_end:]
-    
-    peak_reflected = np.max(np.abs(reflected_region)) if len(reflected_region) > 0 else 0
-    peak_transmitted = np.max(np.abs(transmitted_region)) if len(transmitted_region) > 0 else 0
-    
-    return {
-        "n1": n1,
-        "n2": n2,
-        "R_analytical": R_analytical,
-        "T_analytical": T_analytical,
-        "peak_reflected_numerical": peak_reflected,
-        "peak_transmitted_numerical": peak_transmitted,
-    }
+    os.makedirs(output_dir, exist_ok=True)
+
+    f_ghz = result["freqs"] / 1e9
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 8), dpi=120, sharex=True)
+    fig.suptitle(
+        f"FDTD vs Analytic Slab Solution  (eps_r={cfg.eps_r}, "
+        f"d={(cfg.slab_end - cfg.slab_start) * cfg.dx * 1e3:.0f} mm, "
+        f"sigma={cfg.sigma} S/m)",
+        fontsize=13, fontweight="bold")
+
+    ax1.plot(f_ghz, result["R_analytic_f"], color="#111827", linewidth=2.5,
+             alpha=0.45, label="Analytic |R(f)|  (Airy / Fabry-Perot)")
+    ax1.plot(f_ghz, result["R_f"], color="#EF4444", linewidth=1.3,
+             label="FDTD |R(f)|  (two-run measurement)")
+    ax1.set_ylabel("|R|")
+    ax1.set_title(f"Reflection — max error {result['max_R_error']:.4f}", fontsize=10)
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(f_ghz, result["T_analytic_f"], color="#111827", linewidth=2.5,
+             alpha=0.45, label="Analytic |T(f)|")
+    ax2.plot(f_ghz, result["T_f"], color="#2563EB", linewidth=1.3,
+             label="FDTD |T(f)|")
+    ax2.set_xlabel("Frequency (GHz)")
+    ax2.set_ylabel("|T|")
+    ax2.set_title(f"Transmission — max error {result['max_T_error']:.4f}", fontsize=10)
+    ax2.legend(fontsize=9)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(output_dir, "validation_spectra.png")
+    plt.savefig(path, bbox_inches="tight")
+    plt.close()
+    print(f"  [SAVED] {path}")
+    return path
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -350,25 +467,44 @@ def generate_report(engine: FDTDEngine, rt_data: dict, output_dir: str = "result
     report.append(f"   Conductivity      : {cfg.sigma} S/m")
     report.append(f"   Refractive index  : n = {np.sqrt(cfg.eps_r):.3f}")
     report.append("")
-    report.append("3. REFLECTION / TRANSMISSION ANALYSIS")
-    report.append(f"   Analytical Fresnel R   : {rt_data['R_analytical']:.4f}")
-    report.append(f"   Analytical Fresnel T   : {rt_data['T_analytical']:.4f}")
-    report.append(f"   Numerical peak (refl)  : {rt_data['peak_reflected_numerical']:.6f}")
-    report.append(f"   Numerical peak (trans) : {rt_data['peak_transmitted_numerical']:.6f}")
+    report.append("3. REFLECTION / TRANSMISSION (two-run measurement)")
+    lo, hi = rt_data["band_hz"]
+    report.append(f"   Measurement band  : {lo/1e9:.2f} – {hi/1e9:.2f} GHz")
+    report.append(f"   Recording length  : {rt_data['num_steps']} steps")
+    report.append(f"   Reflected power   : {rt_data['R_power']*100:.2f} %")
+    report.append(f"   Transmitted power : {rt_data['T_power']*100:.2f} %")
+    report.append(f"   R + T             : {rt_data['power_sum']*100:.2f} %"
+                  f"   (must be 100 % for a lossless slab)")
     report.append("")
-    report.append("4. ENERGY CONSERVATION")
+    report.append("4. VALIDATION AGAINST CLOSED-FORM SLAB SOLUTION")
+    report.append(f"   Analytic R power  : {rt_data['R_power_analytic']*100:.2f} %")
+    report.append(f"   Analytic T power  : {rt_data['T_power_analytic']*100:.2f} %")
+    report.append(f"   max |R_fdtd - R_theory| : {rt_data['max_R_error']:.5f}")
+    report.append(f"   max |T_fdtd - T_theory| : {rt_data['max_T_error']:.5f}")
+    report.append(f"   rms |R_fdtd - R_theory| : {rt_data['rms_R_error']:.5f}")
+    report.append(f"   rms |T_fdtd - T_theory| : {rt_data['rms_T_error']:.5f}")
+    report.append("   Reference: Airy (Fabry-Perot) summation over the slab's")
+    report.append("   infinite series of internal reflections.")
+    report.append("")
+    report.append("5. ENERGY BOOKKEEPING")
     peak_e = max(engine.energy_history)
     final_e = engine.energy_history[-1]
     report.append(f"   Peak energy       : {peak_e:.6e} J")
-    report.append(f"   Final energy      : {final_e:.6e} J")
-    report.append(f"   Energy retention  : {(final_e / peak_e * 100) if peak_e > 0 else 0:.1f}%")
-    report.append(f"   (Energy leaves through ABCs — expected behaviour)")
+    report.append(f"   Energy still in grid after {cfg.num_steps} steps : "
+                  f"{(final_e / peak_e * 100) if peak_e > 0 else 0:.2f} %")
+    report.append(f"   ... after {rt_data['num_steps']} steps (measurement run) : "
+                  f"{rt_data['residual_energy_fraction'] * 100:.4f} %")
+    report.append("   Energy is not conserved inside the grid by design: the")
+    report.append("   absorbing boundaries carry it out. The measurement run is")
+    report.append("   long enough that what remains is negligible, which is what")
+    report.append("   makes the spectra above trustworthy.")
     report.append("")
-    report.append("5. NUMERICAL METHOD")
+    report.append("6. NUMERICAL METHOD")
     report.append("   Algorithm         : Yee FDTD (Finite-Difference Time-Domain)")
     report.append("   Boundary cond.    : First-order Mur Absorbing BC")
     report.append("   Source type       : Gaussian pulse (soft / additive)")
-    report.append("   Stability         : Courant condition satisfied (S <= 1)")
+    report.append(f"   Stability         : Courant S = {cfg.courant} <= 1 (satisfied)")
+    report.append(f"   Dispersion limit  : band capped at >= 20 cells/wavelength")
     report.append("")
     report.append("=" * 65)
     
@@ -402,15 +538,19 @@ def main():
     parser.add_argument("--output", type=str, default="results",
                         help="Output directory for plots and report")
     args = parser.parse_args()
-    
-    # Configure
-    cfg = SimConfig(
-        num_cells=args.cells,
-        num_steps=args.steps,
-        eps_r=args.eps_r,
-        sigma=args.sigma,
-    )
-    
+
+    # Configure. A bad layout (e.g. --cells smaller than the slab position)
+    # is a usage error, so report it as one rather than as a traceback.
+    try:
+        cfg = SimConfig(
+            num_cells=args.cells,
+            num_steps=args.steps,
+            eps_r=args.eps_r,
+            sigma=args.sigma,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
     print()
     print("=" * 60)
     print("  1-D FDTD ELECTROMAGNETIC WAVE SIMULATOR")
@@ -435,10 +575,17 @@ def main():
     plot_snapshots(engine, args.output)
     plot_energy(engine, args.output)
     print()
-    
-    # Reflection/Transmission analysis
-    rt_data = compute_reflection_transmission(engine)
-    
+
+    # Reflection/Transmission measurement — needs its own, longer pair of runs
+    # (empty reference + slab) so the scattered field can be isolated and the
+    # slab's internal reverberation has time to leak out.
+    from scattering import measure_scattering, default_num_steps
+    meas_steps = max(default_num_steps(cfg), cfg.num_steps)
+    print(f"  Measuring R/T (2 runs x {meas_steps} steps) ...")
+    rt_data = measure_scattering(cfg, num_steps=meas_steps)
+    plot_validation(rt_data, cfg, args.output)
+    print()
+
     # Report
     print("  Generating technical report ...")
     generate_report(engine, rt_data, args.output)
